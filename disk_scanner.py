@@ -4,6 +4,7 @@
 import os
 import sys
 import time
+import ctypes
 from pathlib import Path
 from datetime import datetime
 from heapq import nlargest
@@ -19,18 +20,98 @@ MIN_DIR_SIZE_HIERARCHY = 500 * 1024 * 1024  # 500 MB в байтах
 # Максимальное количество результатов для отображения
 MAX_RESULTS = 100
 
+# Константы для Windows API (для определения реального размера на диске)
+if sys.platform == 'win32':
+    # FILE_ATTRIBUTE_OFFLINE указывает, что данные не доступны локально
+    FILE_ATTRIBUTE_OFFLINE = 0x1000
+    # FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS указывает, что файл является "по требованию"
+    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x400000
+    # Для получения атрибутов файла
+    kernel32 = ctypes.windll.kernel32
+    GetFileAttributesW = kernel32.GetFileAttributesW
+    GetFileAttributesW.argtypes = [ctypes.c_wchar_p]
+    GetFileAttributesW.restype = ctypes.c_uint32
+    # Для получения реального размера на диске
+    GetCompressedFileSizeW = kernel32.GetCompressedFileSizeW
+    GetCompressedFileSizeW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulong)]
+    GetCompressedFileSizeW.restype = ctypes.c_ulong
+    INVALID_FILE_SIZE = 0xFFFFFFFF
+
 # Форматирование размеров файлов для удобного чтения
 def format_size(size_bytes):
     """Преобразует размер в байтах в человекочитаемый формат"""
+    if size_bytes < 0:
+        return "0 B"
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if size_bytes < 1024 or unit == 'TB':
             return f"{size_bytes:.2f} {unit}"
         size_bytes /= 1024
 
-# Получение размера директории и её поддиректорий
+# Проверка, является ли файл "облачным" в OneDrive или другом облачном хранилище
+def is_cloud_file(file_path):
+    """Проверяет, является ли файл облачным (OneDrive и др.)"""
+    if sys.platform != 'win32':
+        return False
+    
+    try:
+        # Проверка пути на наличие OneDrive
+        if 'onedrive' in file_path.lower():
+            # Получаем атрибуты файла через Windows API
+            attributes = GetFileAttributesW(file_path)
+            if attributes == INVALID_FILE_SIZE:
+                return False
+            
+            # Проверяем атрибуты, указывающие на "облачный" файл
+            return bool(attributes & FILE_ATTRIBUTE_OFFLINE) or bool(attributes & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+    except:
+        pass
+    
+    return False
+
+# Получение реального размера файла на диске
+def get_actual_disk_size(file_path):
+    """
+    Возвращает реальный размер файла на диске, учитывая сжатие и облачное хранение.
+    Для облачных файлов возвращает 0, если файл не занимает место на диске.
+    """
+    if sys.platform == 'win32':
+        try:
+            # Проверяем, является ли файл облачным
+            if is_cloud_file(file_path):
+                # Для облачных файлов, которые не хранятся локально, возвращаем 0
+                return 0
+            
+            # Получаем реальный размер на диске через Windows API
+            high_order = ctypes.c_ulong(0)
+            low_order = GetCompressedFileSizeW(file_path, ctypes.byref(high_order))
+            if low_order == INVALID_FILE_SIZE:
+                # Если не удалось получить размер, используем обычный метод
+                return os.path.getsize(file_path)
+            
+            # Вычисляем полный размер (high_order * 2^32 + low_order)
+            return (high_order.value << 32) + low_order
+        except:
+            # В случае ошибки, используем обычный метод
+            try:
+                return os.path.getsize(file_path)
+            except:
+                return 0
+    else:
+        # Для не-Windows систем используем обычный метод
+        try:
+            # stat.st_blocks * 512 дает реальный размер на диске в Unix-системах
+            return os.stat(file_path).st_blocks * 512
+        except:
+            try:
+                return os.path.getsize(file_path)
+            except:
+                return 0
+
+# Получение размера директории и её поддиректорий, учитывая реальный размер на диске
 def get_dir_size_and_subdirs(path):
     """
-    Рекурсивно вычисляет размер директории и возвращает структуру поддиректорий
+    Рекурсивно вычисляет размер директории и возвращает структуру поддиректорий,
+    учитывая реальный размер файлов на диске.
     Возвращает: (общий размер, словарь {поддиректория: (размер, поддиректории)})
     """
     total_size = 0
@@ -41,8 +122,8 @@ def get_dir_size_and_subdirs(path):
         for entry in os.scandir(path):
             try:
                 if entry.is_file(follow_symlinks=False):
-                    # Это файл, просто добавляем его размер
-                    file_size = entry.stat().st_size
+                    # Это файл, получаем его реальный размер на диске
+                    file_size = get_actual_disk_size(entry.path)
                     total_size += file_size
                 elif entry.is_dir(follow_symlinks=False):
                     # Это директория, рекурсивно вычисляем её размер и структуру
@@ -115,11 +196,14 @@ def scan_system(start_path):
             total_items_scanned += 1
             try:
                 file_path = os.path.join(root, file)
-                # Получаем размер файла
-                file_size = os.path.getsize(file_path)
+                # Получаем реальный размер файла на диске
+                file_size = get_actual_disk_size(file_path)
+                
                 # Если файл больше минимального размера, добавляем в список
                 if file_size >= MIN_FILE_SIZE:
-                    large_files.append((file_path, file_size))
+                    # Добавляем информацию о том, является ли файл облачным
+                    is_cloud = is_cloud_file(file_path)
+                    large_files.append((file_path, file_size, is_cloud))
             except (PermissionError, FileNotFoundError, OSError):
                 # Игнорируем ошибки доступа
                 continue
@@ -182,12 +266,27 @@ def main():
     else:
         # По умолчанию используем корневую директорию
         if sys.platform == 'win32':
-            start_path = os.environ.get('SYSTEMDRIVE', 'C:\\')
+            start_path = os.environ.get('SYSTEMDRIVE', 'C:') + '\\'
         else:
             start_path = '/'
     
     print(f"Текущая дата и время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Сканирование начинается с: {start_path}")
+    
+    # Определяем, запущена ли программа с административными правами
+    is_admin = False
+    if sys.platform == 'win32':
+        try:
+            is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except:
+            is_admin = False
+    else:
+        is_admin = os.geteuid() == 0 if hasattr(os, 'geteuid') else False
+
+    if not is_admin:
+        print("\nВНИМАНИЕ: Программа запущена без административных прав.")
+        print("Некоторые файлы и папки могут быть недоступны для сканирования.")
+        print("Для полного сканирования рекомендуется запустить программу с правами администратора.\n")
     
     # Запускаем сканирование
     start_time = time.time()
@@ -202,22 +301,26 @@ def main():
         # Вывод информации о больших файлах
         print("\n" + "="*80)
         print(f"ТОП-{MAX_RESULTS} САМЫХ БОЛЬШИХ ФАЙЛОВ (более {format_size(MIN_FILE_SIZE)}):")
+        print("Размер указан с учетом реального места, занимаемого на диске")
         print("="*80)
-        for i, (file_path, file_size) in enumerate(largest_files, 1):
-            print(f"{i}. {file_path}")
-            print(f"   Размер: {format_size(file_size)}")
+        for i, (file_path, file_size, is_cloud) in enumerate(largest_files, 1):
+            cloud_status = " [Облачный файл]" if is_cloud else ""
+            print(f"{i}. {file_path}{cloud_status}")
+            print(f"   Размер на диске: {format_size(file_size)}")
         
         # Вывод информации о больших директориях
         print("\n" + "="*80)
         print(f"ТОП-{MAX_RESULTS} САМЫХ БОЛЬШИХ ДИРЕКТОРИЙ:")
+        print("Размер указан с учетом реального места, занимаемого на диске")
         print("="*80)
         for i, (dir_path, dir_size) in enumerate(largest_dirs, 1):
             print(f"{i}. {dir_path}")
-            print(f"   Размер: {format_size(dir_size)}")
+            print(f"   Размер на диске: {format_size(dir_size)}")
         
         # Вывод иерархии директорий
         print("\n" + "="*80)
         print(f"ИЕРАРХИЯ ДИРЕКТОРИЙ (более {format_size(MIN_DIR_SIZE_HIERARCHY)}):")
+        print("Размер указан с учетом реального места, занимаемого на диске")
         print("="*80)
         
         # Сохранение результатов в файл
@@ -225,21 +328,23 @@ def main():
         try:
             with open(output_file, 'w', encoding='utf-8') as f:
                 f.write(f"Отчет о дисковом пространстве от {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"Сканирование начиналось с: {start_path}\n\n")
+                f.write(f"Сканирование начиналось с: {start_path}\n")
+                f.write("Размеры указаны с учетом реального места, занимаемого на диске\n\n")
                 
                 f.write("="*80 + "\n")
                 f.write(f"ТОП-{MAX_RESULTS} САМЫХ БОЛЬШИХ ФАЙЛОВ (более {format_size(MIN_FILE_SIZE)}):\n")
                 f.write("="*80 + "\n")
-                for i, (file_path, file_size) in enumerate(largest_files, 1):
-                    f.write(f"{i}. {file_path}\n")
-                    f.write(f"   Размер: {format_size(file_size)}\n")
+                for i, (file_path, file_size, is_cloud) in enumerate(largest_files, 1):
+                    cloud_status = " [Облачный файл]" if is_cloud else ""
+                    f.write(f"{i}. {file_path}{cloud_status}\n")
+                    f.write(f"   Размер на диске: {format_size(file_size)}\n")
                 
                 f.write("\n" + "="*80 + "\n")
                 f.write(f"ТОП-{MAX_RESULTS} САМЫХ БОЛЬШИХ ДИРЕКТОРИЙ:\n")
                 f.write("="*80 + "\n")
                 for i, (dir_path, dir_size) in enumerate(largest_dirs, 1):
                     f.write(f"{i}. {dir_path}\n")
-                    f.write(f"   Размер: {format_size(dir_size)}\n")
+                    f.write(f"   Размер на диске: {format_size(dir_size)}\n")
                 
                 f.write("\n" + "="*80 + "\n")
                 f.write(f"ИЕРАРХИЯ ДИРЕКТОРИЙ (более {format_size(MIN_DIR_SIZE_HIERARCHY)}):\n")
